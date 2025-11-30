@@ -1,26 +1,35 @@
-use std::{collections::HashMap, io::BufRead, path::Path};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+use memmap2::Mmap;
+
+struct StationSummary {
+    min: f64,
+    max: f64,
+    sum: f64,
+    count: u32,
+}
 
 fn main() {
-    // measurements.txt
     let measurements_file = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("1brc")
         .join("measurements.txt");
-    // read line by line, without reading the whole file into memory
     let file = std::fs::File::open(measurements_file).unwrap();
-    let reader = std::io::BufReader::new(file);
-    struct StationSummary {
-        min: f64,
-        max: f64,
-        sum: f64,
-        count: u32,
-    }
+    let mmap = unsafe { Mmap::map(&file).unwrap() };
+    let mut file_bytes = mmap.as_ref();
+
     let mut measurements: HashMap<String, StationSummary> = HashMap::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
+    while file_bytes.len() > 0 {
+        let newline_pos = file_bytes.iter().position(|&b| b == b'\n').unwrap();
+        let line = &file_bytes[..newline_pos];
+        file_bytes = &file_bytes[newline_pos + 1..]; // skip newline
+
         // format: <string: station name>;<double: measurement>
-        let parts: Vec<&str> = line.split(';').collect();
-        let station_name = parts[0];
-        let measurement: f64 = parts[1].parse().unwrap();
+        let semicolon_pos = line.iter().position(|&b| b == b';').unwrap();
+        let station_name = std::str::from_utf8(&line[..semicolon_pos]).unwrap();
+        let measurement_str = std::str::from_utf8(&line[semicolon_pos + 1..]).unwrap();
+        let measurement: f64 = measurement_str.parse().unwrap();
+
         measurements
             .entry(station_name.to_string())
             .and_modify(|summary| {
@@ -43,7 +52,7 @@ fn main() {
     // output
     // format: {Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, Abéché=-10.0/29.4/69.0, Accra=-10.1/26.4/66.4, Addis Ababa=-23.7/16.0/67.0, Adelaide=-27.8/17.3/58.5, ...}
     let mut output = String::from("{");
-    for (station_name, summary) in &measurements {
+    for (station_name, summary) in &BTreeMap::from_iter(measurements.iter()) {
         let avg = summary.sum / summary.count as f64;
         output.push_str(&format!(
             "{station_name}={:.1}/{:.1}/{:.1}, ",
