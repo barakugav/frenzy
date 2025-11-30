@@ -1,0 +1,115 @@
+use std::mem::MaybeUninit;
+
+pub(crate) struct SimpleHashMap<K, V, S = std::hash::RandomState> {
+    hash_builder: S,
+    table_mask: u64,
+    table: Box<[Entry<K, V>]>,
+    fallback: Box<std::collections::HashMap<K, V>>,
+}
+struct Entry<K, V> {
+    // Vacant,
+    // Occupied(NonZero<u64>, K, V),
+    hash: u64,
+    kv: MaybeUninit<EntryKV<K, V>>,
+}
+struct EntryKV<K, V> {
+    key: K,
+    value: V,
+}
+impl<K, V, S> SimpleHashMap<K, V, S> {
+    pub fn new(max_capacity: usize, safety_factor: f32) -> Self
+    where
+        S: Default,
+    {
+        let max_capacity = ((max_capacity as f32 * safety_factor) as usize).next_power_of_two();
+        let mut table = (0..max_capacity)
+            .map(|_| Entry {
+                hash: 0,
+                kv: MaybeUninit::zeroed(),
+            })
+            .collect::<Box<[_]>>();
+        table[0].hash = 1;
+        let table_mask = (max_capacity - 1) as u64;
+
+        let fallback_capacity = (max_capacity / 64).min(64);
+        Self {
+            table_mask,
+            table,
+            hash_builder: S::default(),
+            fallback: Box::new(std::collections::HashMap::with_capacity(fallback_capacity)),
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_or_default<'a>(&'a mut self, key: K) -> &'a mut V
+    where
+        K: std::hash::Hash + Eq,
+        V: Default,
+        S: std::hash::BuildHasher,
+    {
+        let hash = self.hash_builder.hash_one(&key);
+
+        let bucket = (hash & self.table_mask) as usize;
+        if self.table[bucket].hash == hash {
+            if key == unsafe { self.table[bucket].kv.assume_init_ref() }.key {
+                return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;
+            }
+        }
+
+        if self.table[bucket].hash != 0 {
+            // - if bucket is occupied by a different key
+            // - if we hit bucket 0, possibly because the key hash is 0
+            return self.get_or_default_fallback(key);
+        }
+
+        self.table[bucket] = Entry {
+            hash,
+            kv: MaybeUninit::new(EntryKV {
+                key,
+                value: V::default(),
+            }),
+        };
+        return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn get_or_default_fallback<'a>(&'a mut self, key: K) -> &'a mut V
+    where
+        K: std::hash::Hash + Eq,
+        V: Default,
+    {
+        self.fallback.entry(key).or_default()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        struct Iter<'a, K, V> {
+            table: &'a [Entry<K, V>],
+            idx: usize,
+        }
+        impl<'a, K, V> Iterator for Iter<'a, K, V> {
+            type Item = (&'a K, &'a V);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                while self.idx < self.table.len() {
+                    let entry = &self.table[self.idx];
+                    self.idx += 1;
+                    if entry.hash != 0 {
+                        let kv = &unsafe { entry.kv.assume_init_ref() };
+                        return Some((&kv.key, &kv.value));
+                    }
+                }
+                None
+            }
+        }
+        let table_iter = Iter {
+            table: &self.table,
+            idx: 0,
+        };
+        table_iter.chain(self.fallback.iter())
+    }
+
+    pub(crate) fn fallback_size(&self) -> usize {
+        self.fallback.len()
+    }
+}
