@@ -1,12 +1,13 @@
+use core::str;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use memmap2::Mmap;
 
 struct StationSummary {
-    min: f64,
-    max: f64,
-    sum: f64,
+    min: i16,
+    max: i16,
+    sum: i64,
     count: u32,
 }
 
@@ -26,9 +27,8 @@ fn main() {
 
         // format: <string: station name>;<double: measurement>
         let semicolon_pos = line.iter().position(|&b| b == b';').unwrap();
-        let station_name = std::str::from_utf8(&line[..semicolon_pos]).unwrap();
-        let measurement_str = std::str::from_utf8(&line[semicolon_pos + 1..]).unwrap();
-        let measurement: f64 = measurement_str.parse().unwrap();
+        let station_name = unsafe { std::str::from_utf8_unchecked(&line[..semicolon_pos]) };
+        let measurement: i16 = unsafe { parse_temperature(&line[semicolon_pos + 1..]) };
 
         measurements
             .entry(station_name)
@@ -39,13 +39,13 @@ fn main() {
                 if measurement > summary.max {
                     summary.max = measurement;
                 }
-                summary.sum += measurement;
+                summary.sum += measurement as i64;
                 summary.count += 1;
             })
             .or_insert(StationSummary {
                 min: measurement,
                 max: measurement,
-                sum: measurement,
+                sum: measurement as i64,
                 count: 1,
             });
     }
@@ -53,7 +53,7 @@ fn main() {
     // format: {Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, Abéché=-10.0/29.4/69.0, Accra=-10.1/26.4/66.4, Addis Ababa=-23.7/16.0/67.0, Adelaide=-27.8/17.3/58.5, ...}
     let mut output = String::from("{");
     for (station_name, summary) in &BTreeMap::from_iter(measurements.iter()) {
-        let avg = summary.sum / summary.count as f64;
+        let avg = summary.sum as f64 / 10.0 / summary.count as f64;
         output.push_str(&format!(
             "{station_name}={:.1}/{:.1}/{:.1}, ",
             summary.min, summary.max, avg
@@ -63,4 +63,45 @@ fn main() {
     output.pop();
     output.push('}');
     println!("{}", output);
+}
+
+/// # Safety
+///
+/// It must be OK to dereference `s.as_ptr().offset(-1)``, doesn't matter what this address contains
+#[inline(always)]
+unsafe fn parse_temperature(s: &[u8]) -> i16 {
+    #[inline(always)]
+    unsafe fn parse_temperature_impl(s: &[u8]) -> i16 {
+        let len = s.len() as isize;
+        let p = s.as_ptr();
+        unsafe {
+            let frac = *p.offset(len - 1) - b'0';
+            let d0 = *p.offset(len - 3) - b'0';
+            let d1 = (*p.offset(len - 4)).wrapping_sub(b'0');
+            let positive = *p != b'-';
+
+            let d1_valid = len >= 5 - (positive as isize);
+
+            let mut value =
+                /* digit -1 */  (frac as i16)
+                /* digit 0 */ + (d0 as i16 * 10)
+                /* digit 1 */ + ((d1 * (d1_valid as u8)) as i16 * 100);
+            value *= ((positive as i16) << 1) - 1;
+            value
+        }
+    }
+
+    let value = unsafe { parse_temperature_impl(s) };
+
+    #[cfg(debug_assertions)]
+    {
+        let s = str::from_utf8(s).unwrap();
+        let expected_value = s.parse::<f64>().unwrap();
+        debug_assert_eq!(
+            value,
+            (expected_value * 10.0) as i16,
+            "parsed value does not match standard library parsing for str '{s}'"
+        );
+    }
+    value
 }
