@@ -18,7 +18,7 @@ fn main() {
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let mut file_bytes = mmap.as_ref();
 
-    let mut measurements: HashMap<String, StationSummary> = HashMap::new();
+    let mut measurements: HashMap<&str, StationSummary> = HashMap::with_capacity(1000);
     while file_bytes.len() > 0 {
         let newline_pos = file_bytes.iter().position(|&b| b == b'\n').unwrap();
         let line = &file_bytes[..newline_pos];
@@ -31,7 +31,7 @@ fn main() {
         let measurement: f64 = measurement_str.parse().unwrap();
 
         measurements
-            .entry(station_name.to_string())
+            .entry(station_name)
             .and_modify(|summary| {
                 if measurement < summary.min {
                     summary.min = measurement;
