@@ -11,5 +11,5 @@ memmap2 = "0.9"
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
+# strip = true
 panic = 'abort'
