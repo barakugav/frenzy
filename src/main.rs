@@ -1,4 +1,5 @@
 mod hashmap;
+mod xor;
 
 use core::str;
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::hashmap::SimpleHashMap;
+use crate::xor::XorHash;
 
 const DEBUG: bool = true;
 
@@ -34,7 +36,7 @@ fn main() {
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let mut file_bytes = mmap.as_ref();
 
-    let mut measurements = SimpleHashMap::<&str, StationSummary>::new(1000, 128.0);
+    let mut measurements = SimpleHashMap::<&str, StationSummary, XorHash>::new(1000, 128.0);
     while file_bytes.len() > 0 {
         let newline_pos = file_bytes.iter().position(|&b| b == b'\n').unwrap();
         let line = &file_bytes[..newline_pos];
