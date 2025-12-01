@@ -4,7 +4,7 @@ pub(crate) struct SimpleHashMap<K, V, S = std::hash::RandomState> {
     hash_builder: S,
     table_mask: u64,
     table: Box<[Entry<K, V>]>,
-    fallback: Box<std::collections::HashMap<K, V>>,
+    fallback: Box<std::collections::HashMap<K, V, S>>,
 }
 struct Entry<K, V> {
     // Vacant,
@@ -36,7 +36,10 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
             table_mask,
             table,
             hash_builder: S::default(),
-            fallback: Box::new(std::collections::HashMap::with_capacity(fallback_capacity)),
+            fallback: Box::new(std::collections::HashMap::with_capacity_and_hasher(
+                fallback_capacity,
+                S::default(),
+            )),
         }
     }
 
@@ -78,6 +81,7 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
     where
         K: std::hash::Hash + Eq,
         V: Default,
+        S: std::hash::BuildHasher,
     {
         self.fallback.entry(key).or_default()
     }
@@ -104,7 +108,7 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
         }
         let table_iter = Iter {
             table: &self.table,
-            idx: 0,
+            idx: 1, // we dont use bucket 0
         };
         table_iter.chain(self.fallback.iter())
     }

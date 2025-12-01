@@ -2,6 +2,7 @@ mod hashmap;
 mod xor;
 
 use core::str;
+use std::hash::Hash;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -29,6 +30,8 @@ impl Default for StationSummary {
 }
 
 fn main() {
+    assert!(cfg!(target_endian = "little"));
+
     let measurements_file = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("1brc")
         .join("measurements.txt");
@@ -36,7 +39,7 @@ fn main() {
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let mut file_bytes = mmap.as_ref();
 
-    let mut measurements = SimpleHashMap::<&str, StationSummary, XorHash>::new(1000, 128.0);
+    let mut measurements = SimpleHashMap::<StationName, StationSummary, XorHash>::new(1000, 128.0);
     while file_bytes.len() > 0 {
         let newline_pos = file_bytes.iter().position(|&b| b == b'\n').unwrap();
         let line = &file_bytes[..newline_pos];
@@ -44,7 +47,18 @@ fn main() {
 
         // format: <string: station name>;<double: measurement>
         let semicolon_pos = line.iter().position(|&b| b == b';').unwrap();
-        let station_name = unsafe { std::str::from_utf8_unchecked(&line[..semicolon_pos]) };
+        let station_name = {
+            let mut name_prefix = unsafe { line.as_ptr().cast::<u128>().read_unaligned() };
+            let name_length = semicolon_pos + 1; // keep the semicolon
+            let full_name = &line[..name_length];
+            // zero the upper bytes of name_prefix
+            name_prefix &= (1_u128 << (name_length.min(16) * 8)) - 1;
+            StationName {
+                prefix: name_prefix,
+                full_name,
+            }
+        };
+
         let measurement: i16 = unsafe { parse_temperature(&line[semicolon_pos + 1..]) };
 
         let summary = measurements.get_or_default(station_name);
@@ -60,8 +74,11 @@ fn main() {
 
     // output
     // format: {Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, Abéché=-10.0/29.4/69.0, Accra=-10.1/26.4/66.4, Addis Ababa=-23.7/16.0/67.0, Adelaide=-27.8/17.3/58.5, ...}
-    let mut measurements_sorted = measurements.iter().collect::<Vec<_>>();
-    measurements_sorted.sort_by_key(|(station_name, _)| *station_name);
+    let mut measurements_sorted = measurements
+        .iter()
+        .map(|(name, m)| (name.to_string(), m))
+        .collect::<Vec<_>>();
+    measurements_sorted.sort_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
 
     let mut output = String::from("{");
     for (station_name, summary) in &measurements_sorted {
@@ -84,6 +101,40 @@ fn main() {
             measurements.fallback_size(),
             measurements_sorted.len()
         );
+    }
+}
+
+// the name contains ';' at the end
+struct StationName<'a> {
+    prefix: u128,
+    full_name: &'a [u8],
+}
+impl Hash for StationName<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.prefix.hash(state);
+        if self.full_name.len() > 16 {
+            self.full_name[16..].hash(state);
+        }
+    }
+}
+impl PartialEq for StationName<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.prefix != other.prefix {
+            return false;
+        }
+        if self.full_name.len() <= 16 {
+            return true;
+        }
+        if self.full_name.len() != other.full_name.len() {
+            return false;
+        }
+        self.full_name[16..] == other.full_name[16..]
+    }
+}
+impl Eq for StationName<'_> {}
+impl ToString for StationName<'_> {
+    fn to_string(&self) -> String {
+        str::from_utf8(self.full_name).unwrap().to_string()
     }
 }
 
