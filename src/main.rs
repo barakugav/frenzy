@@ -1,9 +1,13 @@
+#![feature(portable_simd)]
+
 mod hashmap;
 mod xor;
 
 use core::str;
 use std::hash::Hash;
 use std::path::Path;
+use std::simd::cmp::SimdPartialEq;
+use std::simd::u8x16;
 
 use memmap2::Mmap;
 
@@ -37,16 +41,18 @@ fn main() {
         .join("measurements.txt");
     let file = std::fs::File::open(measurements_file).unwrap();
     let mmap = unsafe { Mmap::map(&file).unwrap() };
-    let mut file_bytes = mmap.as_ref();
+    let file_bytes: &[u8] = mmap.as_ref();
+    let (mut file_bytes, mut file_len) = (file_bytes.as_ptr(), file_bytes.len());
 
     let mut measurements = SimpleHashMap::<StationName, StationSummary, XorHash>::new(1000, 128.0);
-    while file_bytes.len() > 0 {
-        let newline_pos = file_bytes.iter().position(|&b| b == b'\n').unwrap();
-        let line = &file_bytes[..newline_pos];
-        file_bytes = &file_bytes[newline_pos + 1..]; // skip newline
+    while file_len > 0 {
+        let newline_pos = find_simd(file_bytes, b'\n');
+        let line = unsafe { std::slice::from_raw_parts(file_bytes, newline_pos) };
+        file_bytes = unsafe { file_bytes.add(newline_pos + 1) }; // skip newline
+        file_len -= newline_pos + 1;
 
         // format: <string: station name>;<double: measurement>
-        let semicolon_pos = line.iter().position(|&b| b == b';').unwrap();
+        let semicolon_pos = find_simd(line.as_ptr(), b';');
         let station_name = {
             let mut name_prefix = unsafe { line.as_ptr().cast::<u128>().read_unaligned() };
             let name_length = semicolon_pos + 1; // keep the semicolon
@@ -177,4 +183,30 @@ unsafe fn parse_temperature(s: &[u8]) -> i16 {
         );
     }
     value
+}
+
+fn find_simd(ptr: *const u8, val: u8) -> usize {
+    let ptr = ptr.cast::<[u8; 16]>();
+    let word: [u8; 16] = unsafe { ptr.read() };
+    let word = std::simd::u8x16::from_array(word);
+    let newline_pos = word
+        .simd_eq(u8x16::splat(val))
+        .to_bitmask()
+        .trailing_zeros() as usize;
+    if newline_pos < 16 {
+        return newline_pos;
+    }
+    for i in 1.. {
+        let ptr = unsafe { ptr.cast::<[u8; 16]>().add(i) };
+        let word: [u8; 16] = unsafe { ptr.read() };
+        let word = std::simd::u8x16::from_array(word);
+        let newline_pos = word
+            .simd_eq(u8x16::splat(val))
+            .to_bitmask()
+            .trailing_zeros() as usize;
+        if newline_pos < 16 {
+            return i * 16 + newline_pos;
+        }
+    }
+    unreachable!()
 }
