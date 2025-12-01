@@ -59,10 +59,7 @@ fn main() {
             let full_name = &line[..name_length];
             // zero the upper bytes of name_prefix
             name_prefix &= (1_u128 << (name_length.min(16) * 8)) - 1;
-            StationName {
-                prefix: name_prefix,
-                full_name,
-            }
+            StationName::new(name_prefix, full_name)
         };
 
         let measurement: i16 = unsafe { parse_temperature(&line[semicolon_pos + 1..]) };
@@ -113,13 +110,34 @@ fn main() {
 // the name contains ';' at the end
 struct StationName<'a> {
     prefix: u128,
-    full_name: &'a [u8],
+    len: usize,
+    full_name: *const u8,
+    ph: std::marker::PhantomData<&'a [u8]>,
+}
+impl<'a> StationName<'a> {
+    pub fn new(prefix: u128, full_name: &'a [u8]) -> Self {
+        Self {
+            prefix,
+            full_name: full_name.as_ptr(),
+            len: full_name.len(),
+            ph: std::marker::PhantomData,
+        }
+    }
+
+    fn full_name(&self) -> &[u8] {
+        let len_without_semicolon = self.len - 1;
+        unsafe { std::slice::from_raw_parts(self.full_name, len_without_semicolon) }
+    }
+
+    fn remainder(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.full_name.add(16), self.len - 16) }
+    }
 }
 impl Hash for StationName<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.prefix.hash(state);
-        if self.full_name.len() > 16 {
-            self.full_name[16..].hash(state);
+        if self.len > 16 {
+            self.remainder().hash(state);
         }
     }
 }
@@ -128,19 +146,19 @@ impl PartialEq for StationName<'_> {
         if self.prefix != other.prefix {
             return false;
         }
-        if self.full_name.len() <= 16 {
+        if self.len <= 16 {
             return true;
         }
-        if self.full_name.len() != other.full_name.len() {
+        if self.len != other.len {
             return false;
         }
-        self.full_name[16..] == other.full_name[16..]
+        self.remainder() == other.remainder()
     }
 }
 impl Eq for StationName<'_> {}
 impl ToString for StationName<'_> {
     fn to_string(&self) -> String {
-        str::from_utf8(self.full_name).unwrap().to_string()
+        str::from_utf8(self.full_name()).unwrap().to_string()
     }
 }
 
