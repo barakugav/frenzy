@@ -6,7 +6,6 @@ mod xor;
 
 use core::str;
 use std::hash::Hash;
-use std::path::Path;
 use std::simd::cmp::SimdPartialEq;
 use std::simd::u8x16;
 
@@ -37,9 +36,10 @@ impl Default for StationSummary {
 fn main() {
     assert!(cfg!(target_endian = "little"));
 
-    let measurements_file = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("1brc")
-        .join("measurements.txt");
+    let measurements_file = std::env::args()
+        .skip(1)
+        .next()
+        .expect("Missing measurements file argument");
     let file = std::fs::File::open(measurements_file).unwrap();
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let file_bytes: &[u8] = mmap.as_ref();
