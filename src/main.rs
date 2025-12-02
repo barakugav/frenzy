@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+#![feature(likely_unlikely)]
 
 mod hashmap;
 mod xor;
@@ -45,7 +46,7 @@ fn main() {
     let (mut file_bytes, mut file_len) = (file_bytes.as_ptr(), file_bytes.len());
 
     let mut measurements = SimpleHashMap::<StationName, StationSummary, XorHash>::new(1000, 128.0);
-    while file_len > 0 {
+    while std::hint::likely(file_len > 0) {
         let newline_pos = find_simd(file_bytes, b'\n');
         let line = unsafe { std::slice::from_raw_parts(file_bytes, newline_pos) };
         file_bytes = unsafe { file_bytes.add(newline_pos + 1) }; // skip newline
@@ -65,10 +66,10 @@ fn main() {
         let measurement: i16 = unsafe { parse_temperature(&line[semicolon_pos + 1..]) };
 
         let summary = measurements.get_or_default(station_name);
-        if measurement < summary.min {
+        if std::hint::unlikely(measurement < summary.min) {
             summary.min = measurement;
         }
-        if measurement > summary.max {
+        if std::hint::unlikely(measurement > summary.max) {
             summary.max = measurement;
         }
         summary.sum += measurement as i64;
@@ -212,12 +213,12 @@ fn find_simd(ptr: *const u8, val: u8) -> usize {
     let ptr = ptr.cast::<[u8; 16]>();
     let word: [u8; 16] = unsafe { ptr.read() };
     let word = std::simd::u8x16::from_array(word);
-    let newline_pos = word
+    let value_pos = word
         .simd_eq(u8x16::splat(val))
         .to_bitmask()
         .trailing_zeros() as usize;
-    if newline_pos < 16 {
-        return newline_pos;
+    if value_pos < 16 {
+        return value_pos;
     }
     for i in 1.. {
         let ptr = unsafe { ptr.cast::<[u8; 16]>().add(i) };

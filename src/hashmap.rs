@@ -53,13 +53,13 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
         let hash = self.hash_builder.hash_one(&key);
 
         let bucket = (hash & self.table_mask) as usize;
-        if self.table[bucket].hash == hash {
-            if key == unsafe { self.table[bucket].kv.assume_init_ref() }.key {
+        if std::hint::likely(self.table[bucket].hash == hash) {
+            if std::hint::likely(key == unsafe { self.table[bucket].kv.assume_init_ref() }.key) {
                 return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;
             }
         }
 
-        if self.table[bucket].hash != 0 {
+        if std::hint::unlikely(self.table[bucket].hash != 0) {
             // - if bucket is occupied by a different key
             // - if we hit bucket 0, possibly because the key hash is 0
             return self.get_or_default_fallback(key);
