@@ -25,5 +25,4 @@ subprocess.check_call(
 )
 subprocess.check_call(
     [*exe, proj_dir / "target" / profile / "frenzy", args.measurements_file],
-    cwd=proj_dir,
 )

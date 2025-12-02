@@ -43,27 +43,33 @@ fn main() {
     let file = std::fs::File::open(measurements_file).unwrap();
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let file_bytes: &[u8] = mmap.as_ref();
-    let (mut file_bytes, mut file_len) = (file_bytes.as_ptr(), file_bytes.len());
+    let (mut file_ptr, file_end) = (file_bytes.as_ptr(), unsafe {
+        file_bytes.as_ptr().add(file_bytes.len())
+    });
 
     let mut measurements = SimpleHashMap::<StationName, StationSummary, XorHash>::new(1000, 128.0);
-    while std::hint::likely(file_len > 0) {
-        let newline_pos = find_simd(file_bytes, b'\n');
-        let line = unsafe { std::slice::from_raw_parts(file_bytes, newline_pos) };
-        file_bytes = unsafe { file_bytes.add(newline_pos + 1) }; // skip newline
-        file_len -= newline_pos + 1;
+    while std::hint::likely(file_ptr < file_end) {
+        let newline_pos = find_simd(file_ptr, b'\n');
 
         // format: <string: station name>;<double: measurement>
-        let semicolon_pos = find_simd(line.as_ptr(), b';');
+        let semicolon_pos = find_simd(file_ptr, b';');
         let station_name = {
-            let mut name_prefix = unsafe { line.as_ptr().cast::<u128>().read_unaligned() };
+            let mut name_prefix = unsafe { file_ptr.cast::<u128>().read_unaligned() };
             let name_length = semicolon_pos + 1; // keep the semicolon
-            let full_name = &line[..name_length];
+            let full_name = unsafe { std::slice::from_raw_parts(file_ptr, name_length) };
             // zero the upper bytes of name_prefix
             name_prefix &= (1_u128 << (name_length.min(16) * 8)) - 1;
             StationName::new(name_prefix, full_name)
         };
 
-        let measurement: i16 = unsafe { parse_temperature(&line[semicolon_pos + 1..]) };
+        let measurement: i16 = unsafe {
+            parse_temperature(std::slice::from_raw_parts(
+                file_ptr.add(semicolon_pos + 1),
+                newline_pos - semicolon_pos - 1,
+            ))
+        };
+
+        file_ptr = unsafe { file_ptr.add(newline_pos + 1) }; // skip newline
 
         let summary = measurements.get_or_default(station_name);
         if std::hint::unlikely(measurement < summary.min) {
