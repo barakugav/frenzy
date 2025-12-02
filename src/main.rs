@@ -5,13 +5,13 @@ mod hashmap;
 mod xor;
 
 use core::str;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::simd::cmp::SimdPartialEq;
 use std::simd::u8x16;
 
 use memmap2::Mmap;
 
-use crate::hashmap::SimpleHashMap;
+use crate::hashmap::{KeyHashPair, SimpleHashMap};
 use crate::xor::XorHash;
 
 const DEBUG: bool = true;
@@ -49,17 +49,27 @@ fn main() {
 
     let mut measurements = SimpleHashMap::<StationName, StationSummary, XorHash>::new(1000, 128.0);
     while std::hint::likely(file_ptr < file_end) {
-        let newline_pos = find_simd(file_ptr, b'\n');
+        let newline_pos = find_simd_multi(file_ptr, b'\n');
 
         // format: <string: station name>;<double: measurement>
-        let semicolon_pos = find_simd(file_ptr, b';');
+        let semicolon_pos = find_simd_multi(file_ptr, b';');
         let station_name = {
             let mut name_prefix = unsafe { file_ptr.cast::<u128>().read_unaligned() };
             let name_length = semicolon_pos + 1; // keep the semicolon
             let full_name = unsafe { std::slice::from_raw_parts(file_ptr, name_length) };
-            // zero the upper bytes of name_prefix
-            name_prefix &= (1_u128 << (name_length.min(16) * 8)) - 1;
-            StationName::new(name_prefix, full_name)
+
+            let mut hash = measurements.hasher();
+            if name_length <= 16 {
+                // zero the upper bytes of name_prefix
+                name_prefix &= (1_u128.wrapping_shl((name_length * 8) as u32)) - 1;
+                hash.write_u128(name_prefix);
+            } else {
+                hash.write_u128(name_prefix);
+                hash.write(&full_name[16..]);
+            }
+            let hash = hash.finish();
+            let name = StationName::new(name_prefix, full_name);
+            unsafe { KeyHashPair::new_unchecked(name, hash) }
         };
 
         let measurement: i16 = unsafe {
@@ -215,27 +225,26 @@ unsafe fn parse_temperature(s: &[u8]) -> i16 {
     value
 }
 
-fn find_simd(ptr: *const u8, val: u8) -> usize {
+#[inline(always)]
+fn find_simd_single(ptr: *const u8, val: u8) -> usize {
     let ptr = ptr.cast::<[u8; 16]>();
     let word: [u8; 16] = unsafe { ptr.read() };
-    let word = std::simd::u8x16::from_array(word);
-    let value_pos = word
+    u8x16::from_array(word)
         .simd_eq(u8x16::splat(val))
         .to_bitmask()
-        .trailing_zeros() as usize;
+        .trailing_zeros() as usize
+}
+
+#[inline(always)]
+fn find_simd_multi(ptr: *const u8, val: u8) -> usize {
+    let value_pos = find_simd_single(ptr, val);
     if value_pos < 16 {
         return value_pos;
     }
     for i in 1.. {
-        let ptr = unsafe { ptr.cast::<[u8; 16]>().add(i) };
-        let word: [u8; 16] = unsafe { ptr.read() };
-        let word = std::simd::u8x16::from_array(word);
-        let newline_pos = word
-            .simd_eq(u8x16::splat(val))
-            .to_bitmask()
-            .trailing_zeros() as usize;
-        if newline_pos < 16 {
-            return i * 16 + newline_pos;
+        let value_pos = find_simd_single(unsafe { ptr.add(i * 16) }, val);
+        if value_pos < 16 {
+            return i * 16 + value_pos;
         }
     }
     unreachable!()
