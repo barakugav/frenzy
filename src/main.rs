@@ -110,7 +110,7 @@ fn main() {
 // the name contains ';' at the end
 struct StationName<'a> {
     prefix: u128,
-    len: usize,
+    remainder_len: isize,
     full_name: *const u8,
     ph: std::marker::PhantomData<&'a [u8]>,
 }
@@ -119,25 +119,30 @@ impl<'a> StationName<'a> {
         Self {
             prefix,
             full_name: full_name.as_ptr(),
-            len: full_name.len(),
+            remainder_len: full_name.len().cast_signed() - 16,
             ph: std::marker::PhantomData,
         }
     }
 
+    #[inline(never)]
+    #[cold]
     fn full_name(&self) -> &[u8] {
-        let len_without_semicolon = self.len - 1;
+        let len = (self.remainder_len + 16).cast_unsigned();
+        let len_without_semicolon = len - 1;
         unsafe { std::slice::from_raw_parts(self.full_name, len_without_semicolon) }
     }
 
     fn remainder(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.full_name.add(16), self.len - 16) }
+        unsafe {
+            std::slice::from_raw_parts(self.full_name.add(16), self.remainder_len.cast_unsigned())
+        }
     }
 }
 impl Hash for StationName<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.prefix.hash(state);
-        if self.len > 16 {
-            self.remainder().hash(state);
+        if self.remainder_len > 0 {
+            state.write(&self.remainder());
         }
     }
 }
@@ -146,10 +151,10 @@ impl PartialEq for StationName<'_> {
         if self.prefix != other.prefix {
             return false;
         }
-        if self.len <= 16 {
+        if self.remainder_len <= 0 {
             return true;
         }
-        if self.len != other.len {
+        if self.remainder_len != other.remainder_len {
             return false;
         }
         self.remainder() == other.remainder()
