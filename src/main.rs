@@ -7,7 +7,7 @@ mod xor;
 use core::str;
 use std::hash::{Hash, Hasher};
 use std::simd::cmp::SimdPartialEq;
-use std::simd::u8x16;
+use std::simd::{u8x8, u8x16};
 
 use memmap2::Mmap;
 
@@ -50,23 +50,11 @@ fn main() {
 
     let mut measurements = HashMap::new(1000, 128.0);
     while std::hint::likely((0..BATCH).all(|bi| file_ptr[bi] < file_end[bi])) {
-        let newline_pos = batch(|bi| find_simd_multi(file_ptr[bi], b'\n'));
-
-        // format: <string: station name>;<double: measurement>
-        let semicolon_pos = batch(|bi| find_simd_multi(file_ptr[bi], b';'));
+        let first_word = batch(|bi| unsafe { file_ptr[bi].cast::<u128>().read_unaligned() });
         let station_name = batch(|bi| unsafe {
-            StationName::parse_and_hash(file_ptr[bi], semicolon_pos[bi], measurements.hasher())
+            StationName::parse_and_hash(&mut file_ptr[bi], first_word[bi], measurements.hasher())
         });
-
-        let measurement = batch(|bi| unsafe {
-            parse_temperature(std::slice::from_raw_parts(
-                file_ptr[bi].add(semicolon_pos[bi] + 1),
-                newline_pos[bi] - semicolon_pos[bi] - 1,
-            ))
-        });
-
-        file_ptr = batch(|bi| unsafe { file_ptr[bi].add(newline_pos[bi] + 1) }); // skip newline
-
+        let measurement = batch(|bi| unsafe { parse_temperature(&mut file_ptr[bi]) });
         batch(|bi| {
             measurements
                 .get_or_default(station_name[bi])
@@ -74,26 +62,13 @@ fn main() {
         });
     }
     batch(|bi| {
-        let mut file_ptr = file_ptr[bi];
-        let file_end = file_end[bi];
+        let (mut file_ptr, file_end) = (file_ptr[bi], file_end[bi]);
         while std::hint::likely(file_ptr < file_end) {
-            let newline_pos = find_simd_multi(file_ptr, b'\n');
-
-            // format: <string: station name>;<double: measurement>
-            let semicolon_pos = find_simd_multi(file_ptr, b';');
+            let first_word = unsafe { file_ptr.cast::<u128>().read_unaligned() };
             let station_name = unsafe {
-                StationName::parse_and_hash(file_ptr, semicolon_pos, measurements.hasher())
+                StationName::parse_and_hash(&mut file_ptr, first_word, measurements.hasher())
             };
-
-            let measurement = unsafe {
-                parse_temperature(std::slice::from_raw_parts(
-                    file_ptr.add(semicolon_pos + 1),
-                    newline_pos - semicolon_pos - 1,
-                ))
-            };
-
-            file_ptr = unsafe { file_ptr.add(newline_pos + 1) }; // skip newline
-
+            let measurement = unsafe { parse_temperature(&mut file_ptr) };
             measurements
                 .get_or_default(station_name)
                 .update(measurement);
@@ -151,23 +126,46 @@ impl<'a> StationName<'a> {
     }
 
     unsafe fn parse_and_hash(
-        file_ptr: *const u8,
-        semicolon_pos: usize,
+        file_ptr: &mut *const u8,
+        first_word: u128,
         hash: &impl std::hash::BuildHasher,
     ) -> KeyHashPair<Self> {
-        let mut name_prefix = unsafe { file_ptr.cast::<u128>().read_unaligned() };
-        let name_length = semicolon_pos + 1; // keep the semicolon
-        let full_name = unsafe { std::slice::from_raw_parts(file_ptr, name_length) };
-
+        let mut name_prefix = first_word;
+        let name_length;
+        let full_name;
         let mut hash = hash.build_hasher();
-        if name_length <= 16 {
+
+        let semicolon_pos = u8x16::from_array(name_prefix.to_ne_bytes())
+            .simd_eq(u8x16::splat(b';'))
+            .to_bitmask()
+            .trailing_zeros() as usize;
+        if semicolon_pos < 16 {
+            name_length = semicolon_pos + 1; // keep the semicolon
+            full_name = unsafe { std::slice::from_raw_parts(*file_ptr, name_length) };
             // zero the upper bytes of name_prefix
             name_prefix &= (1_u128.wrapping_shl((name_length * 8) as u32)) - 1;
             hash.write_u128(name_prefix);
         } else {
+            let mut offset = 16;
+            let semicolon_pos = loop {
+                let word = unsafe { file_ptr.add(offset).cast::<[u8; 16]>().read() };
+                let value_pos = u8x16::from_array(word)
+                    .simd_eq(u8x16::splat(b';'))
+                    .to_bitmask()
+                    .trailing_zeros() as usize;
+                if value_pos < 16 {
+                    break offset + value_pos;
+                }
+                offset += 16;
+            };
+            name_length = semicolon_pos + 1; // keep the semicolon
+            full_name = unsafe { std::slice::from_raw_parts(*file_ptr, name_length) };
             hash.write_u128(name_prefix);
             hash.write(&full_name[16..]);
-        }
+        };
+
+        *file_ptr = unsafe { file_ptr.add(name_length) };
+
         let hash = hash.finish();
         let name = StationName::new(name_prefix, full_name);
         unsafe { KeyHashPair::new_unchecked(name, hash) }
@@ -249,7 +247,14 @@ impl StationSummary {
 ///
 /// It must be OK to dereference `s.as_ptr().offset(-1)``, doesn't matter what this address contains
 #[inline(always)]
-unsafe fn parse_temperature(s: &[u8]) -> i16 {
+unsafe fn parse_temperature(file_ptr: &mut *const u8) -> i16 {
+    let newline_pos = u8x8::from_array(unsafe { (*file_ptr).cast::<[u8; 8]>().read() })
+        .simd_eq(u8x8::splat(b'\n'))
+        .to_bitmask()
+        .trailing_zeros() as usize;
+    unsafe { std::hint::assert_unchecked(newline_pos < 8) };
+    let s = unsafe { std::slice::from_raw_parts(*file_ptr, newline_pos) };
+
     #[inline(always)]
     unsafe fn parse_temperature_impl(s: &[u8]) -> i16 {
         let len = s.len() as isize;
@@ -283,30 +288,8 @@ unsafe fn parse_temperature(s: &[u8]) -> i16 {
             "parsed value does not match standard library parsing for str '{s}'"
         );
     }
+
+    *file_ptr = unsafe { file_ptr.add(newline_pos + 1) }; // skip newline
+
     value
-}
-
-#[inline(always)]
-fn find_simd_single(ptr: *const u8, val: u8) -> usize {
-    let ptr = ptr.cast::<[u8; 16]>();
-    let word: [u8; 16] = unsafe { ptr.read() };
-    u8x16::from_array(word)
-        .simd_eq(u8x16::splat(val))
-        .to_bitmask()
-        .trailing_zeros() as usize
-}
-
-#[inline(always)]
-fn find_simd_multi(ptr: *const u8, val: u8) -> usize {
-    let value_pos = find_simd_single(ptr, val);
-    if value_pos < 16 {
-        return value_pos;
-    }
-    for i in 1.. {
-        let value_pos = find_simd_single(unsafe { ptr.add(i * 16) }, val);
-        if value_pos < 16 {
-            return i * 16 + value_pos;
-        }
-    }
-    unreachable!()
 }

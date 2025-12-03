@@ -128,7 +128,7 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct KeyHashPair<K> {
-    key: K,
+    pub key: K,
     hash: u64,
 }
 impl<K> KeyHashPair<K> {
