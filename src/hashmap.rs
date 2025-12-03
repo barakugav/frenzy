@@ -114,11 +114,11 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
         table_iter.chain(self.fallback.iter())
     }
 
-    pub(crate) fn hasher(&self) -> S::Hasher
+    pub(crate) fn hasher(&self) -> &S
     where
         S: std::hash::BuildHasher,
     {
-        self.hasher.build_hasher()
+        &self.hasher
     }
 
     pub(crate) fn fallback_size(&self) -> usize {
@@ -126,6 +126,7 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct KeyHashPair<K> {
     key: K,
     hash: u64,

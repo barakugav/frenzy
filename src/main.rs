@@ -16,22 +16,7 @@ use crate::xor::XorHash;
 
 const DEBUG: bool = true;
 
-struct StationSummary {
-    min: i16,
-    max: i16,
-    sum: i64,
-    count: u32,
-}
-impl Default for StationSummary {
-    fn default() -> Self {
-        Self {
-            min: i16::MAX,
-            max: i16::MIN,
-            sum: 0,
-            count: 0,
-        }
-    }
-}
+type HashMap<'a> = SimpleHashMap<StationName<'a>, StationSummary, XorHash>;
 
 fn main() {
     assert!(cfg!(target_endian = "little"));
@@ -43,54 +28,77 @@ fn main() {
     let file = std::fs::File::open(measurements_file).unwrap();
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let file_bytes: &[u8] = mmap.as_ref();
-    let (mut file_ptr, file_end) = (file_bytes.as_ptr(), unsafe {
-        file_bytes.as_ptr().add(file_bytes.len())
-    });
 
-    let mut measurements = SimpleHashMap::<StationName, StationSummary, XorHash>::new(1000, 128.0);
-    while std::hint::likely(file_ptr < file_end) {
-        let newline_pos = find_simd_multi(file_ptr, b'\n');
+    const BATCH: usize = 4;
+    fn batch<T>(f: impl FnMut(usize) -> T) -> [T; BATCH] {
+        std::array::from_fn(f)
+    }
+    let (mut file_ptr, file_end) = {
+        let idx = batch(|bi| {
+            let idx = (bi as f64 * file_bytes.len() as f64 / BATCH as f64) as usize;
+            let aligned_idx = idx + file_bytes[idx..].iter().position(|&b| b == b'\n').unwrap();
+            aligned_idx
+        });
+        let file_ptr = batch(|bi| unsafe { file_bytes.as_ptr().add(idx[bi]) });
+        let file_end = batch(|bi| unsafe {
+            file_bytes
+                .as_ptr()
+                .add(*idx.get(bi + 1).unwrap_or(&file_bytes.len()))
+        });
+        (file_ptr, file_end)
+    };
+
+    let mut measurements = HashMap::new(1000, 128.0);
+    while std::hint::likely((0..BATCH).all(|bi| file_ptr[bi] < file_end[bi])) {
+        let newline_pos = batch(|bi| find_simd_multi(file_ptr[bi], b'\n'));
 
         // format: <string: station name>;<double: measurement>
-        let semicolon_pos = find_simd_multi(file_ptr, b';');
-        let station_name = {
-            let mut name_prefix = unsafe { file_ptr.cast::<u128>().read_unaligned() };
-            let name_length = semicolon_pos + 1; // keep the semicolon
-            let full_name = unsafe { std::slice::from_raw_parts(file_ptr, name_length) };
+        let semicolon_pos = batch(|bi| find_simd_multi(file_ptr[bi], b';'));
+        let station_name = batch(|bi| unsafe {
+            StationName::parse_and_hash(file_ptr[bi], semicolon_pos[bi], measurements.hasher())
+        });
 
-            let mut hash = measurements.hasher();
-            if name_length <= 16 {
-                // zero the upper bytes of name_prefix
-                name_prefix &= (1_u128.wrapping_shl((name_length * 8) as u32)) - 1;
-                hash.write_u128(name_prefix);
-            } else {
-                hash.write_u128(name_prefix);
-                hash.write(&full_name[16..]);
-            }
-            let hash = hash.finish();
-            let name = StationName::new(name_prefix, full_name);
-            unsafe { KeyHashPair::new_unchecked(name, hash) }
-        };
-
-        let measurement: i16 = unsafe {
+        let measurement = batch(|bi| unsafe {
             parse_temperature(std::slice::from_raw_parts(
-                file_ptr.add(semicolon_pos + 1),
-                newline_pos - semicolon_pos - 1,
+                file_ptr[bi].add(semicolon_pos[bi] + 1),
+                newline_pos[bi] - semicolon_pos[bi] - 1,
             ))
-        };
+        });
 
-        file_ptr = unsafe { file_ptr.add(newline_pos + 1) }; // skip newline
+        file_ptr = batch(|bi| unsafe { file_ptr[bi].add(newline_pos[bi] + 1) }); // skip newline
 
-        let summary = measurements.get_or_default(station_name);
-        if std::hint::unlikely(measurement < summary.min) {
-            summary.min = measurement;
-        }
-        if std::hint::unlikely(measurement > summary.max) {
-            summary.max = measurement;
-        }
-        summary.sum += measurement as i64;
-        summary.count += 1;
+        batch(|bi| {
+            measurements
+                .get_or_default(station_name[bi])
+                .update(measurement[bi]);
+        });
     }
+    batch(|bi| {
+        let mut file_ptr = file_ptr[bi];
+        let file_end = file_end[bi];
+        while std::hint::likely(file_ptr < file_end) {
+            let newline_pos = find_simd_multi(file_ptr, b'\n');
+
+            // format: <string: station name>;<double: measurement>
+            let semicolon_pos = find_simd_multi(file_ptr, b';');
+            let station_name = unsafe {
+                StationName::parse_and_hash(file_ptr, semicolon_pos, measurements.hasher())
+            };
+
+            let measurement = unsafe {
+                parse_temperature(std::slice::from_raw_parts(
+                    file_ptr.add(semicolon_pos + 1),
+                    newline_pos - semicolon_pos - 1,
+                ))
+            };
+
+            file_ptr = unsafe { file_ptr.add(newline_pos + 1) }; // skip newline
+
+            measurements
+                .get_or_default(station_name)
+                .update(measurement);
+        }
+    });
 
     // output
     // format: {Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, Abéché=-10.0/29.4/69.0, Accra=-10.1/26.4/66.4, Addis Ababa=-23.7/16.0/67.0, Adelaide=-27.8/17.3/58.5, ...}
@@ -125,6 +133,7 @@ fn main() {
 }
 
 // the name contains ';' at the end
+#[derive(Clone, Copy)]
 struct StationName<'a> {
     prefix: u128,
     remainder_len: isize,
@@ -139,6 +148,29 @@ impl<'a> StationName<'a> {
             remainder_len: full_name.len().cast_signed() - 16,
             ph: std::marker::PhantomData,
         }
+    }
+
+    unsafe fn parse_and_hash(
+        file_ptr: *const u8,
+        semicolon_pos: usize,
+        hash: &impl std::hash::BuildHasher,
+    ) -> KeyHashPair<Self> {
+        let mut name_prefix = unsafe { file_ptr.cast::<u128>().read_unaligned() };
+        let name_length = semicolon_pos + 1; // keep the semicolon
+        let full_name = unsafe { std::slice::from_raw_parts(file_ptr, name_length) };
+
+        let mut hash = hash.build_hasher();
+        if name_length <= 16 {
+            // zero the upper bytes of name_prefix
+            name_prefix &= (1_u128.wrapping_shl((name_length * 8) as u32)) - 1;
+            hash.write_u128(name_prefix);
+        } else {
+            hash.write_u128(name_prefix);
+            hash.write(&full_name[16..]);
+        }
+        let hash = hash.finish();
+        let name = StationName::new(name_prefix, full_name);
+        unsafe { KeyHashPair::new_unchecked(name, hash) }
     }
 
     #[inline(never)]
@@ -181,6 +213,35 @@ impl Eq for StationName<'_> {}
 impl ToString for StationName<'_> {
     fn to_string(&self) -> String {
         str::from_utf8(self.full_name()).unwrap().to_string()
+    }
+}
+
+struct StationSummary {
+    min: i16,
+    max: i16,
+    sum: i64,
+    count: u32,
+}
+impl Default for StationSummary {
+    fn default() -> Self {
+        Self {
+            min: i16::MAX,
+            max: i16::MIN,
+            sum: 0,
+            count: 0,
+        }
+    }
+}
+impl StationSummary {
+    fn update(&mut self, measurement: i16) {
+        if std::hint::unlikely(measurement < self.min) {
+            self.min = measurement;
+        }
+        if std::hint::unlikely(measurement > self.max) {
+            self.max = measurement;
+        }
+        self.sum += measurement as i64;
+        self.count += 1;
     }
 }
 
