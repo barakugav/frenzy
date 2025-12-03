@@ -112,14 +112,14 @@ fn main() {
 struct StationName<'a> {
     prefix: u128,
     remainder_len: isize,
-    full_name: *const u8,
+    remainder_ptr: *const u8,
     ph: std::marker::PhantomData<&'a [u8]>,
 }
 impl<'a> StationName<'a> {
     pub fn new(prefix: u128, full_name: &'a [u8]) -> Self {
         Self {
             prefix,
-            full_name: full_name.as_ptr(),
+            remainder_ptr: unsafe { full_name.as_ptr().add(16) },
             remainder_len: full_name.len().cast_signed() - 16,
             ph: std::marker::PhantomData,
         }
@@ -171,17 +171,9 @@ impl<'a> StationName<'a> {
         unsafe { KeyHashPair::new_unchecked(name, hash) }
     }
 
-    #[inline(never)]
-    #[cold]
-    fn full_name(&self) -> &[u8] {
-        let len = (self.remainder_len + 16).cast_unsigned();
-        let len_without_semicolon = len - 1;
-        unsafe { std::slice::from_raw_parts(self.full_name, len_without_semicolon) }
-    }
-
     fn remainder(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(self.full_name.add(16), self.remainder_len.cast_unsigned())
+            std::slice::from_raw_parts(self.remainder_ptr, self.remainder_len.cast_unsigned())
         }
     }
 }
@@ -209,8 +201,14 @@ impl PartialEq for StationName<'_> {
 }
 impl Eq for StationName<'_> {}
 impl ToString for StationName<'_> {
+    #[inline(never)]
+    #[cold]
     fn to_string(&self) -> String {
-        str::from_utf8(self.full_name()).unwrap().to_string()
+        let len = (self.remainder_len + 16).cast_unsigned();
+        let len_without_semicolon = len - 1;
+        let full_name_ptr = unsafe { self.remainder_ptr.offset(-16) };
+        let full_name = unsafe { std::slice::from_raw_parts(full_name_ptr, len_without_semicolon) };
+        str::from_utf8(full_name).unwrap().to_string()
     }
 }
 
