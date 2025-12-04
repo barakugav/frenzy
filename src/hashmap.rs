@@ -54,6 +54,7 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
         let (key, hash) = (pair.key, pair.hash);
 
         let bucket = (hash & self.table_mask) as usize;
+        unsafe { std::hint::assert_unchecked(bucket < self.table.len()) };
         if std::hint::likely(self.table[bucket].hash == hash) {
             if std::hint::likely(key == unsafe { self.table[bucket].kv.assume_init_ref() }.key) {
                 return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;

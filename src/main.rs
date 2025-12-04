@@ -7,7 +7,7 @@ mod xor;
 use core::str;
 use std::hash::{Hash, Hasher};
 use std::simd::cmp::SimdPartialEq;
-use std::simd::{u8x8, u8x16};
+use std::simd::{Simd, u8x16};
 
 use memmap2::Mmap;
 
@@ -132,7 +132,6 @@ impl<'a> StationName<'a> {
     ) -> KeyHashPair<Self> {
         let mut name_prefix = first_word;
         let name_length;
-        let full_name;
         let mut hash = hash.build_hasher();
 
         let semicolon_pos = u8x16::from_array(name_prefix.to_ne_bytes())
@@ -141,29 +140,47 @@ impl<'a> StationName<'a> {
             .trailing_zeros() as usize;
         if semicolon_pos < 16 {
             name_length = semicolon_pos + 1; // keep the semicolon
-            full_name = unsafe { std::slice::from_raw_parts(*file_ptr, name_length) };
             // zero the upper bytes of name_prefix
             name_prefix &= (1_u128.wrapping_shl((name_length * 8) as u32)) - 1;
             hash.write_u128(name_prefix);
         } else {
+            hash.write_u128(name_prefix);
             let mut offset = 16;
-            let semicolon_pos = loop {
-                let word = unsafe { file_ptr.add(offset).cast::<[u8; 16]>().read() };
-                let value_pos = u8x16::from_array(word)
-                    .simd_eq(u8x16::splat(b';'))
+            loop {
+                const STEP_WORDS: usize = 1;
+                const STEP_BYTES: usize = STEP_WORDS * 8;
+                let words = unsafe {
+                    file_ptr
+                        .add(offset)
+                        .cast::<[u64; STEP_WORDS]>()
+                        .read_unaligned()
+                };
+                let words_bytes =
+                    unsafe { std::mem::transmute::<[u64; STEP_WORDS], [u8; STEP_BYTES]>(words) };
+                let value_pos = Simd::<u8, _>::from_array(words_bytes)
+                    .simd_eq(Simd::splat(b';'))
                     .to_bitmask()
                     .trailing_zeros() as usize;
-                if value_pos < 16 {
-                    break offset + value_pos;
+                if value_pos < STEP_BYTES {
+                    let words_len = value_pos + 1; // keep the semicolon
+                    name_length = offset + words_len;
+                    for word in words.iter().take(value_pos / 8) {
+                        hash.write_u64(*word);
+                    }
+                    hash.write_u64(
+                        words[value_pos / 8]
+                            & ((1_u64.wrapping_shl(((words_len % 8) * 8) as u32)) - 1),
+                    );
+                    break;
                 }
-                offset += 16;
-            };
-            name_length = semicolon_pos + 1; // keep the semicolon
-            full_name = unsafe { std::slice::from_raw_parts(*file_ptr, name_length) };
-            hash.write_u128(name_prefix);
-            hash.write(&full_name[16..]);
+                offset += STEP_BYTES;
+                for word in words {
+                    hash.write_u64(word);
+                }
+            }
         };
 
+        let full_name = unsafe { std::slice::from_raw_parts(*file_ptr, name_length) };
         *file_ptr = unsafe { file_ptr.add(name_length) };
 
         let hash = hash.finish();
@@ -246,8 +263,8 @@ impl StationSummary {
 /// It must be OK to dereference `s.as_ptr().offset(-1)``, doesn't matter what this address contains
 #[inline(always)]
 unsafe fn parse_temperature(file_ptr: &mut *const u8) -> i16 {
-    let newline_pos = u8x8::from_array(unsafe { (*file_ptr).cast::<[u8; 8]>().read() })
-        .simd_eq(u8x8::splat(b'\n'))
+    let newline_pos = Simd::from_array(unsafe { (*file_ptr).cast::<[u8; 8]>().read() })
+        .simd_eq(Simd::splat(b'\n'))
         .to_bitmask()
         .trailing_zeros() as usize;
     unsafe { std::hint::assert_unchecked(newline_pos < 8) };
