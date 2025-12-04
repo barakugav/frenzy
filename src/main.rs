@@ -19,11 +19,10 @@ const DEBUG: bool = true;
 type HashMap<'a> = SimpleHashMap<StationName<'a>, StationSummary, XorHash>;
 
 fn main() {
-    assert!(cfg!(target_endian = "little"));
+    const { assert!(cfg!(target_endian = "little")) };
 
     let measurements_file = std::env::args()
-        .skip(1)
-        .next()
+        .nth(1)
         .expect("Missing measurements file argument");
     let file = std::fs::File::open(measurements_file).unwrap();
     let mmap = unsafe { Mmap::map(&file).unwrap() };
@@ -35,64 +34,38 @@ fn main() {
     // and the second part (the "remainder") with bounds checks.
     let remainder_idx = {
         let idx = file_bytes.len().saturating_sub(128);
-        let aligned_idx = idx
-            - file_bytes[..idx]
-                .iter()
-                .rev()
-                .position(|&b| b == b'\n')
-                .unwrap();
-        aligned_idx
+
+        idx - file_bytes[..idx]
+            .iter()
+            .rev()
+            .position(|&b| b == b'\n')
+            .unwrap()
     };
     let (file_bytes, mut file_bytes_remainder) = file_bytes.split_at(remainder_idx);
 
-    const BATCH: usize = 4;
-    fn batch<T>(f: impl FnMut(usize) -> T) -> [T; BATCH] {
-        std::array::from_fn(f)
-    }
-    let (mut file_ptr, file_end) = {
-        let idx = batch(|bi| {
-            let idx = (bi as f64 * file_bytes.len() as f64 / BATCH as f64) as usize;
-            let aligned_idx = idx + file_bytes[idx..].iter().position(|&b| b == b'\n').unwrap() + 1;
-            aligned_idx
-        });
-        let file_ptr = batch(|bi| unsafe { file_bytes.as_ptr().add(idx[bi]) });
-        let file_end = batch(|bi| unsafe {
-            file_bytes
-                .as_ptr()
-                .add(*idx.get(bi + 1).unwrap_or(&file_bytes.len()))
-        });
-        (file_ptr, file_end)
-    };
-
-    let mut measurements = HashMap::new(1000, 128.0);
-    while std::hint::likely((0..BATCH).all(|bi| file_ptr[bi] < file_end[bi])) {
-        let first_word = batch(|bi| unsafe { file_ptr[bi].cast::<u128>().read_unaligned() });
-        let station_name = batch(|bi| unsafe {
-            StationName::parse_and_hash(&mut file_ptr[bi], first_word[bi], measurements.hasher())
-        });
-        let measurement = batch(|bi| unsafe { parse_temperature(&mut file_ptr[bi]) });
-        batch(|bi| {
-            measurements
-                .get_or_default(station_name[bi])
-                .update(measurement[bi]);
-        });
-    }
-    batch(|bi| {
-        let (mut file_ptr, file_end) = (file_ptr[bi], file_end[bi]);
-        while std::hint::likely(file_ptr < file_end) {
-            let first_word = unsafe { file_ptr.cast::<u128>().read_unaligned() };
-            let station_name = unsafe {
-                StationName::parse_and_hash(&mut file_ptr, first_word, measurements.hasher())
-            };
-            let measurement = unsafe { parse_temperature(&mut file_ptr) };
-            measurements
-                .get_or_default(station_name)
-                .update(measurement);
+    let mut measurements = std::thread::scope(|scope| {
+        let workers_num = std::thread::available_parallelism().unwrap().get();
+        let file_bytes = split_bytes_aligned(file_bytes, workers_num);
+        let workers = file_bytes
+            .into_iter()
+            .map(|file_bytes| scope.spawn(move || parse_file_bytes(file_bytes)))
+            .collect::<Vec<_>>();
+        let mut measurements = HashMap::new(1000, 128.0);
+        for worker in workers {
+            let worker_measurements = worker.join().unwrap();
+            for (station_name, summary) in worker_measurements.iter() {
+                let global_summary = measurements.get_or_default(station_name.clone());
+                global_summary.min = global_summary.min.min(summary.min);
+                global_summary.max = global_summary.max.max(summary.max);
+                global_summary.sum += summary.sum;
+                global_summary.count += summary.count;
+            }
         }
+        measurements
     });
 
     // process remainder (trivially, no optimizations)
-    while file_bytes_remainder.len() > 0 {
+    while !file_bytes_remainder.is_empty() {
         let newline_pos = file_bytes_remainder
             .iter()
             .position(|&b| b == b'\n')
@@ -111,7 +84,7 @@ fn main() {
             },
             name_bytes,
         );
-        let measurement = std::str::from_utf8(&measurement_bytes)
+        let measurement = std::str::from_utf8(measurement_bytes)
             .unwrap()
             .parse::<f64>()
             .unwrap();
@@ -151,6 +124,49 @@ fn main() {
             measurements_sorted.len()
         );
     }
+}
+
+#[inline(never)]
+fn parse_file_bytes<'a>(file_bytes: &'a [u8]) -> HashMap<'a> {
+    const BATCH: usize = 4;
+    fn batch<T>(f: impl FnMut(usize) -> T) -> [T; BATCH] {
+        std::array::from_fn(f)
+    }
+    let (mut file_ptr, file_end) = {
+        let splits = split_bytes_aligned(file_bytes, BATCH);
+        let splits: [&[u8]; BATCH] = splits.try_into().unwrap();
+        let file_ptr = batch(|bi| splits[bi].as_ptr());
+        let file_end = batch(|bi| unsafe { splits[bi].as_ptr().add(splits[bi].len()) });
+        (file_ptr, file_end)
+    };
+
+    let mut measurements = HashMap::new(1000, 128.0);
+    while std::hint::likely((0..BATCH).all(|bi| file_ptr[bi] < file_end[bi])) {
+        let first_word = batch(|bi| unsafe { file_ptr[bi].cast::<u128>().read_unaligned() });
+        let station_name = batch(|bi| unsafe {
+            StationName::parse_and_hash(&mut file_ptr[bi], first_word[bi], measurements.hasher())
+        });
+        let measurement = batch(|bi| unsafe { parse_temperature(&mut file_ptr[bi]) });
+        batch(|bi| {
+            measurements
+                .get_or_default(station_name[bi])
+                .update(measurement[bi]);
+        });
+    }
+    batch(|bi| {
+        let (mut file_ptr, file_end) = (file_ptr[bi], file_end[bi]);
+        while std::hint::likely(file_ptr < file_end) {
+            let first_word = unsafe { file_ptr.cast::<u128>().read_unaligned() };
+            let station_name = unsafe {
+                StationName::parse_and_hash(&mut file_ptr, first_word, measurements.hasher())
+            };
+            let measurement = unsafe { parse_temperature(&mut file_ptr) };
+            measurements
+                .get_or_default(station_name)
+                .update(measurement);
+        }
+    });
+    measurements
 }
 
 // the name contains ';' at the end
@@ -244,7 +260,7 @@ impl Hash for StationName<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.prefix.hash(state);
         if self.remainder_len > 0 {
-            state.write(&self.remainder());
+            state.write(self.remainder());
         }
     }
 }
@@ -263,6 +279,7 @@ impl PartialEq for StationName<'_> {
     }
 }
 impl Eq for StationName<'_> {}
+#[allow(clippy::to_string_trait_impl)]
 impl ToString for StationName<'_> {
     #[inline(never)]
     #[cold]
@@ -274,6 +291,8 @@ impl ToString for StationName<'_> {
         str::from_utf8(full_name).unwrap().to_string()
     }
 }
+unsafe impl<'a> Send for StationName<'a> {}
+unsafe impl<'a> Sync for StationName<'a> {}
 
 struct StationSummary {
     min: i16,
@@ -353,4 +372,22 @@ unsafe fn parse_temperature(file_ptr: &mut *const u8) -> i16 {
     *file_ptr = unsafe { file_ptr.add(newline_pos + 1) }; // skip newline
 
     value
+}
+
+#[inline(never)]
+fn split_bytes_aligned(bytes: &[u8], splits_num: usize) -> Vec<&[u8]> {
+    assert!(splits_num >= 1);
+    let mut split_indices = Vec::with_capacity(splits_num - 1);
+    for i in 1..splits_num {
+        let idx = (i as f64 * bytes.len() as f64 / splits_num as f64) as usize;
+        let aligned_idx = idx + bytes[idx..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        split_indices.push(aligned_idx);
+    }
+    (0..splits_num)
+        .map(|i| {
+            let start = if i == 0 { 0 } else { split_indices[i - 1] };
+            let end = split_indices.get(i).copied().unwrap_or(bytes.len());
+            &bytes[start..end]
+        })
+        .collect()
 }

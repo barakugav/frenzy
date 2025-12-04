@@ -14,7 +14,7 @@ pub(crate) struct XorHasher(u64);
 impl Hasher for XorHasher {
     #[inline(always)]
     fn write_u64(&mut self, i: u64) {
-        self.0 ^= i as u64;
+        self.0 ^= i;
     }
 
     #[inline(always)]

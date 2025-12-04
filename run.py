@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,7 +22,12 @@ else:
     profile = "release"
 
 subprocess.check_call(
-    ["cargo", "build", f"--profile={profile}", "--quiet"], cwd=proj_dir
+    ["cargo", "build", f"--profile={profile}", "--quiet"],
+    cwd=proj_dir,
+    env={
+        **os.environ,
+        "RUSTFLAGS": "-C target-cpu=native",
+    },
 )
 subprocess.check_call(
     [*exe, proj_dir / "target" / profile / "frenzy", args.measurements_file],

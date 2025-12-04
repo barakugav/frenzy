@@ -4,6 +4,7 @@ pub(crate) struct SimpleHashMap<K, V, S = std::hash::RandomState> {
     hasher: S,
     table_mask: u64,
     table: Box<[Entry<K, V>]>,
+    #[allow(clippy::box_collection)]
     fallback: Box<std::collections::HashMap<K, V, S>>,
 }
 struct Entry<K, V> {
@@ -44,7 +45,7 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
     }
 
     #[inline(always)]
-    pub fn get_or_default<'a>(&'a mut self, key: impl Key<K>) -> &'a mut V
+    pub fn get_or_default(&mut self, key: impl Key<K>) -> &mut V
     where
         K: std::hash::Hash + Eq,
         V: Default,
@@ -55,10 +56,10 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
 
         let bucket = (hash & self.table_mask) as usize;
         unsafe { std::hint::assert_unchecked(bucket < self.table.len()) };
-        if std::hint::likely(self.table[bucket].hash == hash) {
-            if std::hint::likely(key == unsafe { self.table[bucket].kv.assume_init_ref() }.key) {
-                return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;
-            }
+        if std::hint::likely(self.table[bucket].hash == hash)
+            && std::hint::likely(key == unsafe { self.table[bucket].kv.assume_init_ref() }.key)
+        {
+            return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;
         }
 
         if std::hint::unlikely(self.table[bucket].hash != 0) {
@@ -74,12 +75,12 @@ impl<K, V, S> SimpleHashMap<K, V, S> {
                 value: V::default(),
             }),
         };
-        return &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value;
+        &mut unsafe { self.table[bucket].kv.assume_init_mut() }.value
     }
 
     #[inline(never)]
     #[cold]
-    fn get_or_default_fallback<'a>(&'a mut self, key: K) -> &'a mut V
+    fn get_or_default_fallback(&mut self, key: K) -> &mut V
     where
         K: std::hash::Hash + Eq,
         V: Default,
