@@ -29,6 +29,22 @@ fn main() {
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     let file_bytes: &[u8] = mmap.as_ref();
 
+    // sometimes we read 128 bytes ahead, without checking if we reached EOF.
+    // to avoid reading past EOF, we find the last newline before the last 128 bytes,
+    // and split the file there. The main loop will process the first part without bounds checks,
+    // and the second part (the "remainder") with bounds checks.
+    let remainder_idx = {
+        let idx = file_bytes.len().saturating_sub(128);
+        let aligned_idx = idx
+            - file_bytes[..idx]
+                .iter()
+                .rev()
+                .position(|&b| b == b'\n')
+                .unwrap();
+        aligned_idx
+    };
+    let (file_bytes, mut file_bytes_remainder) = file_bytes.split_at(remainder_idx);
+
     const BATCH: usize = 4;
     fn batch<T>(f: impl FnMut(usize) -> T) -> [T; BATCH] {
         std::array::from_fn(f)
@@ -36,7 +52,7 @@ fn main() {
     let (mut file_ptr, file_end) = {
         let idx = batch(|bi| {
             let idx = (bi as f64 * file_bytes.len() as f64 / BATCH as f64) as usize;
-            let aligned_idx = idx + file_bytes[idx..].iter().position(|&b| b == b'\n').unwrap();
+            let aligned_idx = idx + file_bytes[idx..].iter().position(|&b| b == b'\n').unwrap() + 1;
             aligned_idx
         });
         let file_ptr = batch(|bi| unsafe { file_bytes.as_ptr().add(idx[bi]) });
@@ -74,6 +90,36 @@ fn main() {
                 .update(measurement);
         }
     });
+
+    // process remainder (trivially, no optimizations)
+    while file_bytes_remainder.len() > 0 {
+        let newline_pos = file_bytes_remainder
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap();
+        let line = &file_bytes_remainder[..newline_pos];
+        file_bytes_remainder = &file_bytes_remainder[newline_pos + 1..]; // skip newline
+
+        let semicolon_pos = line.iter().position(|&b| b == b';').unwrap();
+        let (name_bytes, measurement_bytes) = line.split_at(semicolon_pos + 1); // include ';' in name
+        let station_name = StationName::new(
+            {
+                let mut prefix_bytes = [0_u8; 16];
+                let len = name_bytes.len().min(16);
+                prefix_bytes[..len].copy_from_slice(&name_bytes[..len]);
+                u128::from_ne_bytes(prefix_bytes)
+            },
+            name_bytes,
+        );
+        let measurement = std::str::from_utf8(&measurement_bytes)
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+
+        measurements
+            .get_or_default(station_name)
+            .update((measurement * 10.0) as i16);
+    }
 
     // output
     // format: {Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, Abéché=-10.0/29.4/69.0, Accra=-10.1/26.4/66.4, Addis Ababa=-23.7/16.0/67.0, Adelaide=-27.8/17.3/58.5, ...}
