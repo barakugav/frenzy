@@ -14,7 +14,7 @@ use memmap2::Mmap;
 use crate::hashmap::{KeyHashPair, SimpleHashMap};
 use crate::xor::XorHash;
 
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 
 type HashMap<'a> = SimpleHashMap<StationName<'a>, StationSummary, XorHash>;
 
@@ -102,12 +102,11 @@ fn main() {
 
     let mut output = String::from("{");
     for (station_name, summary) in &measurements_sorted {
-        let avg = summary.sum as f64 / 10.0 / summary.count as f64;
         output.push_str(&format!(
             "{station_name}={:.1}/{:.1}/{:.1}, ",
-            summary.min as f32 / 10.0,
-            summary.max as f32 / 10.0,
-            avg
+            (summary.min as f32).round() / 10.0,
+            (summary.sum as f64 / summary.count as f64).round() / 10.0,
+            (summary.max as f32).round() / 10.0,
         ));
     }
     output.pop();
@@ -117,7 +116,7 @@ fn main() {
 
     if DEBUG {
         println!(
-            "Fallback size: {}/{}",
+            "Hashmap fallback size: {}/{}",
             measurements.fallback_size(),
             measurements_sorted.len()
         );
@@ -252,18 +251,18 @@ impl<'a> StationName<'a> {
                 };
                 let words_bytes =
                     unsafe { std::mem::transmute::<[u64; STEP_WORDS], [u8; STEP_BYTES]>(words) };
-                let value_pos = Simd::<u8, _>::from_array(words_bytes)
+                let semicolon_pos = Simd::<u8, _>::from_array(words_bytes)
                     .simd_eq(Simd::splat(b';'))
                     .to_bitmask()
                     .trailing_zeros() as usize;
-                if value_pos < STEP_BYTES {
-                    name_length = offset + value_pos;
-                    for word in words.iter().take(value_pos / 8) {
+                if semicolon_pos < STEP_BYTES {
+                    name_length = offset + semicolon_pos;
+                    for word in words.iter().take(semicolon_pos / 8) {
                         hash.write_u64(*word);
                     }
                     hash.write_u64(
-                        words[value_pos / 8]
-                            & ((1_u64.wrapping_shl(((value_pos % 8) * 8) as u32)) - 1),
+                        words[semicolon_pos / 8]
+                            & ((1_u64.wrapping_shl(((semicolon_pos % 8) * 8) as u32)) - 1),
                     );
                     break;
                 }
